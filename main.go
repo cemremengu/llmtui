@@ -49,6 +49,7 @@ type (
 		content string
 	}
 )
+
 type streamCompleteMsg struct {
 	content string
 	err     error
@@ -265,7 +266,7 @@ type streamStarted struct {
 
 func startStreamingInBackground(streamChan chan string, client *openai.Client, messages []openai.ChatCompletionMessageParamUnion, modelName string) {
 	defer close(streamChan)
-	
+
 	ctx := context.Background()
 	stream := client.Chat.Completions.NewStreaming(ctx, openai.ChatCompletionNewParams{
 		Messages: messages,
@@ -284,7 +285,7 @@ func startStreamingInBackground(streamChan chan string, client *openai.Client, m
 			}
 		}
 	}
-	
+
 	// Send final result
 	if stream.Err() == nil {
 		select {
@@ -320,8 +321,6 @@ func listenForStreamUpdates(streamChan <-chan string) tea.Cmd {
 		}
 	}
 }
-
-
 
 func main() {
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
