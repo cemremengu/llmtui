@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -14,13 +15,16 @@ import (
 )
 
 type model struct {
-	client    *openai.Client
-	modelName string
-	messages  []chatMessage
-	input     string
-	viewport  string
-	loading   bool
-	err       error
+	client      *openai.Client
+	modelName   string
+	messages    []chatMessage
+	input       string
+	viewport    string
+	loading     bool
+	streaming   bool
+	partialResp string
+	err         error
+	streamChan  chan string
 }
 
 type chatMessage struct {
@@ -29,6 +33,23 @@ type chatMessage struct {
 }
 
 type msgResponse struct {
+	content string
+	err     error
+}
+
+type msgStreamChunk struct {
+	chunk string
+	done  bool
+	err   error
+}
+
+type (
+	streamStartMsg  struct{}
+	streamUpdateMsg struct {
+		content string
+	}
+)
+type streamCompleteMsg struct {
 	content string
 	err     error
 }
@@ -124,6 +145,52 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.messages = append(m.messages, assistantMsg)
 			m.viewport += assistantStyle.Render("LLM: ") + msg.content + "\n\n"
 		}
+	case streamStartMsg:
+		m.streaming = true
+		m.partialResp = ""
+	case streamStarted:
+		// Start streaming with a new subscription
+		m.streamChan = make(chan string, 100)
+		go startStreamingInBackground(m.streamChan, msg.client, msg.messages, msg.modelName)
+		return m, listenForStreamUpdates(m.streamChan)
+	case streamUpdateMsg:
+		if msg.content != "" {
+			m.partialResp = msg.content
+		}
+		// Continue listening for updates using a stored channel
+		if m.streamChan != nil {
+			return m, listenForStreamUpdates(m.streamChan)
+		}
+		return m, nil
+	case streamCompleteMsg:
+		m.loading = false
+		m.streaming = false
+		m.streamChan = nil
+		if msg.err != nil {
+			m.err = msg.err
+		} else {
+			assistantMsg := chatMessage{role: "assistant", content: msg.content}
+			m.messages = append(m.messages, assistantMsg)
+			m.viewport += assistantStyle.Render("LLM: ") + msg.content + "\n\n"
+		}
+		m.partialResp = ""
+	case msgStreamChunk:
+		if msg.err != nil {
+			m.err = msg.err
+			m.loading = false
+			m.streaming = false
+			m.partialResp = ""
+		} else if msg.done {
+			m.loading = false
+			m.streaming = false
+			assistantMsg := chatMessage{role: "assistant", content: msg.chunk}
+			m.messages = append(m.messages, assistantMsg)
+			m.viewport += assistantStyle.Render("LLM: ") + msg.chunk + "\n\n"
+			m.partialResp = ""
+		} else {
+			m.partialResp = msg.chunk
+			m.streaming = true
+		}
 	}
 	return m, nil
 }
@@ -144,7 +211,11 @@ func (m model) View() string {
 	b.WriteString(m.viewport)
 
 	if m.loading {
-		b.WriteString(assistantStyle.Render("LLM is typing..."))
+		if m.streaming && m.partialResp != "" {
+			b.WriteString(assistantStyle.Render("LLM: ") + m.partialResp + assistantStyle.Render("█"))
+		} else {
+			b.WriteString(assistantStyle.Render("LLM is typing..."))
+		}
 		b.WriteString("\n\n")
 	}
 
@@ -160,6 +231,13 @@ func (m model) View() string {
 }
 
 func (m model) sendMessage() tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg { return streamStartMsg{} },
+		m.streamResponse(),
+	)
+}
+
+func (m model) streamResponse() tea.Cmd {
 	return func() tea.Msg {
 		messages := make([]openai.ChatCompletionMessageParamUnion, len(m.messages))
 		for i, msg := range m.messages {
@@ -170,21 +248,80 @@ func (m model) sendMessage() tea.Cmd {
 			}
 		}
 
-		resp, err := m.client.Chat.Completions.New(context.Background(), openai.ChatCompletionNewParams{
-			Messages: messages,
-			Model:    openai.ChatModel(m.modelName),
-		})
-		if err != nil {
-			return msgResponse{err: err}
+		// Start streaming and return the subscription
+		return streamStarted{
+			client:    m.client,
+			messages:  messages,
+			modelName: m.modelName,
 		}
-
-		if len(resp.Choices) == 0 {
-			return msgResponse{err: fmt.Errorf("no response from OpenAI")}
-		}
-
-		return msgResponse{content: resp.Choices[0].Message.Content}
 	}
 }
+
+type streamStarted struct {
+	client    *openai.Client
+	messages  []openai.ChatCompletionMessageParamUnion
+	modelName string
+}
+
+func startStreamingInBackground(streamChan chan string, client *openai.Client, messages []openai.ChatCompletionMessageParamUnion, modelName string) {
+	defer close(streamChan)
+	
+	ctx := context.Background()
+	stream := client.Chat.Completions.NewStreaming(ctx, openai.ChatCompletionNewParams{
+		Messages: messages,
+		Model:    openai.ChatModel(modelName),
+	})
+
+	var fullResponse strings.Builder
+	for stream.Next() {
+		chunk := stream.Current()
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
+			fullResponse.WriteString(chunk.Choices[0].Delta.Content)
+			// Send accumulated content to channel
+			select {
+			case streamChan <- fullResponse.String():
+			default:
+			}
+		}
+	}
+	
+	// Send final result
+	if stream.Err() == nil {
+		select {
+		case streamChan <- "DONE:" + fullResponse.String():
+		default:
+		}
+	} else {
+		select {
+		case streamChan <- "ERROR:" + stream.Err().Error():
+		default:
+		}
+	}
+}
+
+func listenForStreamUpdates(streamChan <-chan string) tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case content, ok := <-streamChan:
+			if !ok {
+				// Channel closed - streaming is done
+				return streamCompleteMsg{content: "", err: nil}
+			}
+			if strings.HasPrefix(content, "DONE:") {
+				return streamCompleteMsg{content: content[5:], err: nil}
+			}
+			if strings.HasPrefix(content, "ERROR:") {
+				return streamCompleteMsg{content: "", err: fmt.Errorf("%s", content[6:])}
+			}
+			return streamUpdateMsg{content: content}
+		case <-time.After(50 * time.Millisecond):
+			// No update yet, return empty update and continue listening
+			return streamUpdateMsg{}
+		}
+	}
+}
+
+
 
 func main() {
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
